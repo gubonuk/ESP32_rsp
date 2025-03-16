@@ -1,0 +1,82 @@
+#!/bin/bash
+# 라즈베리파이에 MQTT 브로커(Mosquitto) 설치 및 설정 스크립트
+
+echo "===== 라즈베리파이 MQTT 브로커 설치 및 설정 ====="
+echo "이 스크립트는 다음 작업을 수행합니다:"
+echo "1. 시스템 업데이트"
+echo "2. Mosquitto MQTT 브로커 설치"
+echo "3. 기본 설정 구성"
+echo "4. 브로커 시작 및 자동 실행 설정"
+echo "5. 방화벽 설정(필요한 경우)"
+echo ""
+echo "계속하려면 ENTER 키를 누르세요..."
+read
+
+# 시스템 업데이트
+echo "시스템 업데이트 중..."
+sudo apt-get update
+sudo apt-get upgrade -y
+
+# Mosquitto 설치
+echo "Mosquitto 브로커 설치 중..."
+sudo apt-get install -y mosquitto mosquitto-clients
+
+# Mosquitto 설정 파일 생성
+echo "Mosquitto 설정 중..."
+sudo tee /etc/mosquitto/conf.d/smartfarm.conf > /dev/null << EOF
+# 스마트팜 Mosquitto 설정
+
+# 네트워크 리스너 설정
+listener 1883
+allow_anonymous true
+
+# 지속성 설정
+persistence true
+persistence_location /var/lib/mosquitto/
+
+# 로그 설정
+log_dest file /var/log/mosquitto/mosquitto.log
+log_type error
+log_type warning
+log_type notice
+log_type information
+
+# 기타 설정
+connection_messages true
+EOF
+
+# 브로커 재시작
+echo "Mosquitto 서비스 재시작 중..."
+sudo systemctl restart mosquitto
+
+# 브로커 상태 확인
+echo "Mosquitto 서비스 상태 확인 중..."
+sudo systemctl status mosquitto
+
+# 자동 시작 설정
+echo "Mosquitto 자동 시작 설정 중..."
+sudo systemctl enable mosquitto
+echo "Mosquitto가 부팅 시 자동으로 시작되도록 설정되었습니다."
+
+# 방화벽 설정 (UFW가 설치된 경우)
+if command -v ufw &> /dev/null
+then
+    echo "방화벽 설정 중..."
+    sudo ufw allow 1883/tcp
+    sudo ufw status
+    echo "포트 1883이 방화벽에서 열렸습니다."
+fi
+
+# 테스트용 구독자 실행
+echo ""
+echo "설정이 완료되었습니다."
+echo ""
+echo "테스트를 위해 다음 명령을 다른 터미널에서 실행하세요:"
+echo "mosquitto_sub -v -t 'smartfarm/#'"
+echo ""
+echo "그런 다음 다음 명령으로 테스트 메시지를 보낼 수 있습니다:"
+echo "mosquitto_pub -t 'smartfarm/test' -m 'Hello MQTT'"
+echo ""
+echo "MQTT 브로커 IP 주소: $(hostname -I | awk '{print $1}')"
+echo ""
+echo "설치 및 설정이 완료되었습니다!"
