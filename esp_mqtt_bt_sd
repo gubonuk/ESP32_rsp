@@ -1,0 +1,198 @@
+/**
+ * ESP32 Wroom 스마트팜 메인 코드 (설정 관리 통합)
+ * 
+ * 목적: SD 카드와 블루투스를 통한 설정 관리 + MQTT 통신
+ */
+
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <DHT.h>
+#include <Servo.h>
+#include <Preferences.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <FS.h>
+#include <SD.h>
+#include <SPI.h>
+
+// 설정 관리 모드를 정의
+#define CONFIG_MODE_SD      0  // SD 카드에서 설정 로드
+#define CONFIG_MODE_BLE     1  // 블루투스로 설정 변경
+#define CONFIG_MODE_MEMORY  2  // 내부 메모리(Preferences)에서 설정 로드
+
+// 사용할 설정 관리 모드 선택
+#define CONFIG_MODE CONFIG_MODE_BLE  // 기본값으로 블루투스 사용
+
+// 핀 설정
+#define DHT_PIN 4
+#define DHT_TYPE DHT22
+#define LED_PIN 12
+#define FAN_PIN 13
+#define PUMP_PIN 14
+#define FEEDER_SERVO_PIN 15
+#define MIC_PIN 35
+#define SD_CS_PIN 5  // SD 카드 CS 핀
+
+// BLE 서비스 및 특성 UUID (설정 모드가 BLE인 경우만 사용)
+#if CONFIG_MODE == CONFIG_MODE_BLE
+  #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+  #define CONFIG_CHAR_UUID    "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+  #define NOTIFY_CHAR_UUID    "beb5483e-36e1-4688-b7f5-ea07361b26a9"
+  #define DEVICE_NAME         "SmartFarm-ESP32"
+  
+  BLEServer* pServer = NULL;
+  BLECharacteristic* pConfigCharacteristic = NULL;
+  BLECharacteristic* pNotifyCharacteristic = NULL;
+  bool deviceConnected = false;
+  bool oldDeviceConnected = false;
+#endif
+
+// 설정 구조체
+struct Config {
+  char wifi_ssid[32];
+  char wifi_password[64];
+  char mqtt_server[64];
+  int mqtt_port;
+  char mqtt_username[32];
+  char mqtt_password[32];
+  char mqtt_client_id[32];
+  
+  // 기본값으로 초기화
+  Config() {
+    strcpy(wifi_ssid, "");
+    strcpy(wifi_password, "");
+    strcpy(mqtt_server, "192.168.1.100");
+    mqtt_port = 1883;
+    strcpy(mqtt_username, "");
+    strcpy(mqtt_password, "");
+    strcpy(mqtt_client_id, "ESP32_Wroom");
+  }
+};
+
+// 전역 변수
+Config config;
+Preferences preferences;
+DHT dht(DHT_PIN, DHT_TYPE);
+Servo feederServo;
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+// MQTT 토픽
+const char* topic_sensor_data = "smartfarm/sensors";
+const char* topic_status = "smartfarm/status/wroom";
+const char* topic_led = "smartfarm/control/led";
+const char* topic_fan = "smartfarm/control/fan";
+const char* topic_pump = "smartfarm/control/pump";
+const char* topic_feeder = "smartfarm/control/feeder";
+const char* topic_mode = "smartfarm/control/mode";
+
+// 상태 변수
+float temperature = 0;
+float humidity = 0;
+bool ledState = false;
+bool fanState = false;
+bool pumpState = false;
+bool autoMode = true;
+float targetTemp = 25.0;
+float targetHumidity = 60.0;
+
+// 타이머 변수
+unsigned long lastSensorPublish = 0;
+const long sensorInterval = 10000; // 10초마다 센서 데이터 발행
+
+//----------------------------------------
+// 설정 관리 함수
+//----------------------------------------
+
+#if CONFIG_MODE == CONFIG_MODE_SD
+/**
+ * SD 카드 초기화 함수
+ */
+bool initSDCard() {
+  Serial.println("SD 카드 초기화 중...");
+  
+  if (!SD.begin(SD_CS_PIN)) {
+    Serial.println("SD 카드 마운트 실패");
+    return false;
+  }
+  
+  Serial.println("SD 카드 초기화 성공");
+  return true;
+}
+
+/**
+ * SD 카드에서 설정 로드
+ */
+bool loadConfigFromSD() {
+  Serial.println("SD 카드에서 설정 로드 중...");
+  
+  // 파일이 없는 경우
+  if (!SD.exists("/config.json")) {
+    Serial.println("설정 파일이 없습니다. 기본 설정을 사용합니다.");
+    return false;
+  }
+  
+  // 파일 열기
+  File configFile = SD.open("/config.json", FILE_READ);
+  if (!configFile) {
+    Serial.println("설정 파일을 열 수 없습니다");
+    return false;
+  }
+  
+  // JSON 파싱
+  StaticJsonDocument<512> doc;
+  DeserializationError error = deserializeJson(doc, configFile);
+  configFile.close();
+  
+  if (error) {
+    Serial.print("설정 파일 파싱 실패: ");
+    Serial.println(error.c_str());
+    return false;
+  }
+  
+  // 값 저장
+  strlcpy(config.wifi_ssid, doc["wifi_ssid"] | "", sizeof(config.wifi_ssid));
+  strlcpy(config.wifi_password, doc["wifi_password"] | "", sizeof(config.wifi_password));
+  strlcpy(config.mqtt_server, doc["mqtt_server"] | "192.168.1.100", sizeof(config.mqtt_server));
+  config.mqtt_port = doc["mqtt_port"] | 1883;
+  strlcpy(config.mqtt_username, doc["mqtt_username"] | "", sizeof(config.mqtt_username));
+  strlcpy(config.mqtt_password, doc["mqtt_password"] | "", sizeof(config.mqtt_password));
+  strlcpy(config.mqtt_client_id, doc["mqtt_client_id"] | "ESP32_Wroom", sizeof(config.mqtt_client_id));
+  
+  Serial.println("SD 카드에서 설정 로드 성공");
+  return true;
+}
+#endif
+
+#if CONFIG_MODE == CONFIG_MODE_BLE
+/**
+ * BLE 콜백 클래스 - 연결 상태
+ */
+class MyServerCallbacks: public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    deviceConnected = true;
+    Serial.println("클라이언트가 연결되었습니다");
+  }
+  
+  void onDisconnect(BLEServer* pServer) {
+    deviceConnected = false;
+    Serial.println("클라이언트 연결이 끊어졌습니다");
+  }
+};
+
+/**
+ * BLE 콜백 클래스 - 설정 특성
+ */
+class ConfigCallbacks: public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) {
+    std::string value = pCharacteristic->getValue();
+    
+    if (value.length() > 0) {
+      Serial.println("새 설정 데이터 수신:");
+      
+      // JSON 파싱
+      StaticJsonDocument<512> doc;
+      DeserializationError error = deserializeJson(doc, value.c_str());
