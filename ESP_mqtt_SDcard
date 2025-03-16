@@ -1,0 +1,200 @@
+/**
+ * ESP32 SD 카드 설정 로더
+ * 
+ * 목적: SD 카드에서 WiFi 및 MQTT 설정을 로드
+ * 파일 형식: config.json
+ */
+
+#include <Arduino.h>
+#include <FS.h>
+#include <SD.h>
+#include <SPI.h>
+#include <ArduinoJson.h>
+
+// SD 카드 핀 설정 - ESP32 기본 SPI 핀
+#define SD_CS          5    // ESP32 Wroom에서는 보통 5번 핀 사용
+#define SPI_MOSI       23   // SD 카드 MOSI
+#define SPI_MISO       19   // SD 카드 MISO
+#define SPI_SCK        18   // SD 카드 SCK
+
+// 설정 구조체
+struct Config {
+  char wifi_ssid[32];
+  char wifi_password[64];
+  char mqtt_server[64];
+  int mqtt_port;
+  char mqtt_username[32];
+  char mqtt_password[32];
+  char mqtt_client_id[32];
+  
+  // 기본값 설정
+  Config() {
+    strcpy(wifi_ssid, "");
+    strcpy(wifi_password, "");
+    strcpy(mqtt_server, "192.168.1.100");  // 기본값
+    mqtt_port = 1883;                       // 기본 MQTT 포트
+    strcpy(mqtt_username, "");
+    strcpy(mqtt_password, "");
+    strcpy(mqtt_client_id, "ESP32_Device"); // 기본 클라이언트 ID
+  }
+};
+
+Config config;
+
+/**
+ * SD 카드 초기화 함수
+ */
+bool initSDCard() {
+  Serial.println("SD 카드 초기화 중...");
+  
+  // SPI 버스 설정 (ESP32에 따라 필요할 수 있음)
+  // SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, SD_CS);
+  
+  if (!SD.begin(SD_CS)) {
+    Serial.println("SD 카드 마운트 실패");
+    return false;
+  }
+  
+  uint8_t cardType = SD.cardType();
+  if (cardType == CARD_NONE) {
+    Serial.println("SD 카드가 연결되지 않았습니다");
+    return false;
+  }
+  
+  Serial.print("SD 카드 타입: ");
+  if (cardType == CARD_MMC) {
+    Serial.println("MMC");
+  } else if (cardType == CARD_SD) {
+    Serial.println("SDSC");
+  } else if (cardType == CARD_SDHC) {
+    Serial.println("SDHC");
+  } else {
+    Serial.println("알 수 없음");
+  }
+  
+  Serial.println("SD 카드 초기화 성공");
+  return true;
+}
+
+/**
+ * 설정 파일 로드 함수
+ */
+bool loadConfiguration() {
+  Serial.println("설정 파일 로드 중...");
+  
+  // 파일이 없는 경우 기본 설정으로 저장
+  if (!SD.exists("/config.json")) {
+    Serial.println("설정 파일이 없습니다. 기본 설정을 사용합니다.");
+    saveConfiguration(); // 기본 설정 저장
+    return false;
+  }
+  
+  // 파일 열기
+  File configFile = SD.open("/config.json", FILE_READ);
+  if (!configFile) {
+    Serial.println("설정 파일을 열 수 없습니다");
+    return false;
+  }
+  
+  // JSON 파싱을 위한 메모리 할당
+  StaticJsonDocument<512> doc;
+  
+  // JSON 파싱
+  DeserializationError error = deserializeJson(doc, configFile);
+  configFile.close();
+  
+  if (error) {
+    Serial.print("설정 파일 파싱 실패: ");
+    Serial.println(error.c_str());
+    return false;
+  }
+  
+  // 값 저장
+  strlcpy(config.wifi_ssid, doc["wifi_ssid"] | "", sizeof(config.wifi_ssid));
+  strlcpy(config.wifi_password, doc["wifi_password"] | "", sizeof(config.wifi_password));
+  strlcpy(config.mqtt_server, doc["mqtt_server"] | "192.168.1.100", sizeof(config.mqtt_server));
+  config.mqtt_port = doc["mqtt_port"] | 1883;
+  strlcpy(config.mqtt_username, doc["mqtt_username"] | "", sizeof(config.mqtt_username));
+  strlcpy(config.mqtt_password, doc["mqtt_password"] | "", sizeof(config.mqtt_password));
+  strlcpy(config.mqtt_client_id, doc["mqtt_client_id"] | "ESP32_Device", sizeof(config.mqtt_client_id));
+  
+  Serial.println("설정 파일 로드 성공");
+  Serial.print("WiFi SSID: ");
+  Serial.println(config.wifi_ssid);
+  Serial.print("MQTT 서버: ");
+  Serial.println(config.mqtt_server);
+  Serial.print("MQTT 포트: ");
+  Serial.println(config.mqtt_port);
+  Serial.print("MQTT 클라이언트 ID: ");
+  Serial.println(config.mqtt_client_id);
+  
+  return true;
+}
+
+/**
+ * 설정 파일 저장 함수 (기본값 또는 업데이트된 설정)
+ */
+bool saveConfiguration() {
+  Serial.println("설정 파일 저장 중...");
+  
+  // 기존 파일 삭제
+  if (SD.exists("/config.json")) {
+    SD.remove("/config.json");
+  }
+  
+  // 파일 생성
+  File configFile = SD.open("/config.json", FILE_WRITE);
+  if (!configFile) {
+    Serial.println("설정 파일 생성 실패");
+    return false;
+  }
+  
+  // JSON 문서 생성
+  StaticJsonDocument<512> doc;
+  
+  // 현재 설정 저장
+  doc["wifi_ssid"] = config.wifi_ssid;
+  doc["wifi_password"] = config.wifi_password;
+  doc["mqtt_server"] = config.mqtt_server;
+  doc["mqtt_port"] = config.mqtt_port;
+  doc["mqtt_username"] = config.mqtt_username;
+  doc["mqtt_password"] = config.mqtt_password;
+  doc["mqtt_client_id"] = config.mqtt_client_id;
+  
+  // JSON 직렬화 및 파일 쓰기
+  if (serializeJson(doc, configFile) == 0) {
+    Serial.println("설정 파일 쓰기 실패");
+    configFile.close();
+    return false;
+  }
+  
+  configFile.close();
+  Serial.println("설정 파일 저장 성공");
+  return true;
+}
+
+// 설정 로드 테스트 함수
+void testConfigLoader() {
+  if (initSDCard()) {
+    if (loadConfiguration()) {
+      Serial.println("SD 카드에서 설정을 성공적으로 로드했습니다");
+    } else {
+      Serial.println("기본 설정을 사용합니다");
+    }
+  } else {
+    Serial.println("SD 카드 초기화 실패, 기본 설정을 사용합니다");
+  }
+}
+
+// 아래는 샘플 config.json 파일 형식입니다:
+/*
+{
+  "wifi_ssid": "your_wifi_ssid",
+  "wifi_password": "your_wifi_password",
+  "mqtt_server": "192.168.1.200",
+  "mqtt_port": 1883,
+  "mqtt_username": "mqtt_user",
+  "mqtt_password": "mqtt_pass",
+  "mqtt_client_id": "ESP32_Wroom"
+}
+*/
