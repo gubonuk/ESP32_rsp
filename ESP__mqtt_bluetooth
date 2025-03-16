@@ -1,0 +1,278 @@
+/**
+ * ESP32 블루투스 설정 관리자
+ * 
+ * 목적: 블루투스 BLE를 통해 WiFi 및 MQTT 설정 구성
+ * 사용법: 모바일 앱에서 ESP32에 연결하여 설정 데이터 전송
+ */
+
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <Preferences.h>
+#include <ArduinoJson.h>
+
+// BLE 서비스 및 특성 UUID
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CONFIG_CHAR_UUID    "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define NOTIFY_CHAR_UUID    "beb5483e-36e1-4688-b7f5-ea07361b26a9"
+
+// 블루투스 장치 이름
+#define DEVICE_NAME "SmartFarm-ESP32"
+
+// 환경설정 저장을 위한 객체
+Preferences preferences;
+
+// BLE 서버 및 특성 변수
+BLEServer* pServer = NULL;
+BLECharacteristic* pConfigCharacteristic = NULL;
+BLECharacteristic* pNotifyCharacteristic = NULL;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+
+// 설정 구조체
+struct Config {
+  char wifi_ssid[32];
+  char wifi_password[64];
+  char mqtt_server[64];
+  int mqtt_port;
+  char mqtt_username[32];
+  char mqtt_password[32];
+  char mqtt_client_id[32];
+};
+
+Config config;
+
+// 연결 상태 콜백 클래스
+class MyServerCallbacks: public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    deviceConnected = true;
+    Serial.println("클라이언트가 연결되었습니다");
+  }
+  
+  void onDisconnect(BLEServer* pServer) {
+    deviceConnected = false;
+    Serial.println("클라이언트 연결이 끊어졌습니다");
+  }
+};
+
+// 특성 콜백 클래스
+class ConfigCallbacks: public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) {
+    std::string value = pCharacteristic->getValue();
+    
+    if (value.length() > 0) {
+      Serial.println("새 설정 데이터 수신:");
+      
+      // JSON 파싱을 위한 메모리 할당
+      StaticJsonDocument<512> doc;
+      
+      // 문자열을 JSON으로 파싱
+      DeserializationError error = deserializeJson(doc, value.c_str());
+      
+      if (error) {
+        Serial.print("설정 JSON 파싱 실패: ");
+        Serial.println(error.c_str());
+        sendNotification("Error: Invalid JSON format");
+        return;
+      }
+      
+      // 설정 업데이트
+      strlcpy(config.wifi_ssid, doc["wifi_ssid"] | "", sizeof(config.wifi_ssid));
+      strlcpy(config.wifi_password, doc["wifi_password"] | "", sizeof(config.wifi_password));
+      strlcpy(config.mqtt_server, doc["mqtt_server"] | "", sizeof(config.mqtt_server));
+      config.mqtt_port = doc["mqtt_port"] | 1883;
+      strlcpy(config.mqtt_username, doc["mqtt_username"] | "", sizeof(config.mqtt_username));
+      strlcpy(config.mqtt_password, doc["mqtt_password"] | "", sizeof(config.mqtt_password));
+      strlcpy(config.mqtt_client_id, doc["mqtt_client_id"] | "", sizeof(config.mqtt_client_id));
+      
+      // 설정 저장
+      saveConfiguration();
+      
+      // 알림 전송
+      sendNotification("Configuration saved successfully");
+      
+      // 설정 로깅
+      Serial.print("WiFi SSID: ");
+      Serial.println(config.wifi_ssid);
+      Serial.print("MQTT 서버: ");
+      Serial.println(config.mqtt_server);
+      Serial.print("MQTT 포트: ");
+      Serial.println(config.mqtt_port);
+    }
+  }
+};
+
+/**
+ * BLE 초기화 함수
+ */
+void initBLE() {
+  // BLE 장치 생성
+  BLEDevice::init(DEVICE_NAME);
+  
+  // BLE 서버 생성
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+  
+  // BLE 서비스 생성
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  
+  // 설정 특성 생성 (읽기/쓰기)
+  pConfigCharacteristic = pService->createCharacteristic(
+                            CONFIG_CHAR_UUID,
+                            BLECharacteristic::PROPERTY_READ |
+                            BLECharacteristic::PROPERTY_WRITE
+                          );
+  pConfigCharacteristic->setCallbacks(new ConfigCallbacks());
+  
+  // 알림 특성 생성 (알림)
+  pNotifyCharacteristic = pService->createCharacteristic(
+                            NOTIFY_CHAR_UUID,
+                            BLECharacteristic::PROPERTY_NOTIFY
+                          );
+  pNotifyCharacteristic->addDescriptor(new BLE2902());
+  
+  // 서비스 시작
+  pService->start();
+  
+  // 광고 시작
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);  // iPhone 연결 문제 방지
+  pAdvertising->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+  
+  Serial.println("BLE 초기화 완료. 연결 대기 중...");
+}
+
+/**
+ * 알림 전송 함수
+ */
+void sendNotification(const char* message) {
+  if (deviceConnected) {
+    pNotifyCharacteristic->setValue(message);
+    pNotifyCharacteristic->notify();
+    Serial.print("알림 전송: ");
+    Serial.println(message);
+  }
+}
+
+/**
+ * BLE 연결 상태 관리
+ */
+void handleBLEConnections() {
+  // 연결 상태 변경 감지
+  if (!deviceConnected && oldDeviceConnected) {
+    delay(500); // 연결 해제 이벤트 처리 시간 확보
+    pServer->startAdvertising(); // 광고 재시작
+    Serial.println("광고 재시작...");
+    oldDeviceConnected = deviceConnected;
+  }
+  
+  // 새 연결 감지
+  if (deviceConnected && !oldDeviceConnected) {
+    // 현재 설정 정보 전송
+    String configJson = getCurrentConfigJson();
+    pConfigCharacteristic->setValue(configJson.c_str());
+    
+    oldDeviceConnected = deviceConnected;
+  }
+}
+
+/**
+ * 현재 설정을 JSON 문자열로 반환
+ */
+String getCurrentConfigJson() {
+  StaticJsonDocument<512> doc;
+  
+  doc["wifi_ssid"] = config.wifi_ssid;
+  doc["mqtt_server"] = config.mqtt_server;
+  doc["mqtt_port"] = config.mqtt_port;
+  doc["mqtt_client_id"] = config.mqtt_client_id;
+  
+  // 보안을 위해 비밀번호는 포함하지 않음
+  doc["wifi_password"] = "*****";
+  doc["mqtt_username"] = config.mqtt_username[0] ? "*****" : "";
+  doc["mqtt_password"] = config.mqtt_password[0] ? "*****" : "";
+  
+  String result;
+  serializeJson(doc, result);
+  return result;
+}
+
+/**
+ * 설정 로드 함수
+ */
+void loadConfiguration() {
+  preferences.begin("smartfarm", false); // 읽기/쓰기 모드로 열기
+  
+  // 저장된 값 읽기
+  String wifi_ssid = preferences.getString("wifi_ssid", "");
+  String wifi_password = preferences.getString("wifi_pass", "");
+  String mqtt_server = preferences.getString("mqtt_server", "192.168.1.100");
+  int mqtt_port = preferences.getInt("mqtt_port", 1883);
+  String mqtt_username = preferences.getString("mqtt_user", "");
+  String mqtt_password = preferences.getString("mqtt_pass", "");
+  String mqtt_client_id = preferences.getString("mqtt_id", "ESP32_Device");
+  
+  // config 구조체에 복사
+  wifi_ssid.toCharArray(config.wifi_ssid, sizeof(config.wifi_ssid));
+  wifi_password.toCharArray(config.wifi_password, sizeof(config.wifi_password));
+  mqtt_server.toCharArray(config.mqtt_server, sizeof(config.mqtt_server));
+  config.mqtt_port = mqtt_port;
+  mqtt_username.toCharArray(config.mqtt_username, sizeof(config.mqtt_username));
+  mqtt_password.toCharArray(config.mqtt_password, sizeof(config.mqtt_password));
+  mqtt_client_id.toCharArray(config.mqtt_client_id, sizeof(config.mqtt_client_id));
+  
+  preferences.end();
+  
+  Serial.println("설정 로드 완료");
+  Serial.print("WiFi SSID: ");
+  Serial.println(config.wifi_ssid);
+  Serial.print("MQTT 서버: ");
+  Serial.println(config.mqtt_server);
+}
+
+/**
+ * 설정 저장 함수
+ */
+void saveConfiguration() {
+  preferences.begin("smartfarm", false);
+  
+  // 값 저장
+  preferences.putString("wifi_ssid", config.wifi_ssid);
+  preferences.putString("wifi_pass", config.wifi_password);
+  preferences.putString("mqtt_server", config.mqtt_server);
+  preferences.putInt("mqtt_port", config.mqtt_port);
+  preferences.putString("mqtt_user", config.mqtt_username);
+  preferences.putString("mqtt_pass", config.mqtt_password);
+  preferences.putString("mqtt_id", config.mqtt_client_id);
+  
+  preferences.end();
+  
+  Serial.println("설정 저장 완료");
+}
+
+// 설정 관리자 초기화 함수
+void initConfigManager() {
+  // 저장된 설정 로드
+  loadConfiguration();
+  
+  // BLE 초기화
+  initBLE();
+}
+
+// 아래는 블루투스 클라이언트에서 전송할 JSON 샘플입니다:
+/*
+{
+  "wifi_ssid": "your_wifi_ssid",
+  "wifi_password": "your_wifi_password",
+  "mqtt_server": "192.168.1.200",
+  "mqtt_port": 1883,
+  "mqtt_username": "mqtt_user",
+  "mqtt_password": "mqtt_pass",
+  "mqtt_client_id": "ESP32_Wroom"
+}
+*/
