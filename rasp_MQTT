@@ -1,0 +1,330 @@
+/**
+ * ESP32 Wroom MQTT 클라이언트 코드
+ * 
+ * 목적: 센서 데이터 수집 및 MQTT를 통한 라즈베리파이 통신
+ */
+
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <DHT.h>
+#include <Servo.h>
+
+// Wi-Fi 설정
+const char* ssid = "YOUR_WIFI_SSID";         // 변경 필요
+const char* password = "YOUR_WIFI_PASSWORD"; // 변경 필요
+
+// MQTT 브로커 설정
+const char* mqtt_server = "RASPBERRY_PI_IP"; // 변경 필요: 라즈베리파이 IP 주소
+const int mqtt_port = 1883;
+const char* mqtt_client_id = "ESP32_Wroom";
+const char* mqtt_username = ""; // 필요한 경우 설정
+const char* mqtt_password = ""; // 필요한 경우 설정
+
+// MQTT 토픽
+// 발행 토픽
+const char* topic_sensor_data = "smartfarm/sensors";
+const char* topic_status = "smartfarm/status/wroom";
+
+// 구독 토픽
+const char* topic_led = "smartfarm/control/led";
+const char* topic_fan = "smartfarm/control/fan";
+const char* topic_pump = "smartfarm/control/pump";
+const char* topic_feeder = "smartfarm/control/feeder";
+const char* topic_mode = "smartfarm/control/mode";
+
+// 핀 설정
+#define DHT_PIN 4
+#define DHT_TYPE DHT22
+#define LED_PIN 12
+#define FAN_PIN 13
+#define PUMP_PIN 14
+#define FEEDER_SERVO_PIN 15
+#define MIC_PIN 35
+
+// 객체 초기화
+DHT dht(DHT_PIN, DHT_TYPE);
+Servo feederServo;
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// 변수
+float temperature = 0;
+float humidity = 0;
+bool ledState = false;
+bool fanState = false;
+bool pumpState = false;
+bool autoMode = true;
+float targetTemp = 25.0;
+float targetHumidity = 60.0;
+
+// 타이머 변수
+unsigned long lastSensorPublish = 0;
+const long sensorInterval = 10000; // 10초마다 센서 데이터 발행
+
+void setup() {
+  // 시리얼 통신 초기화
+  Serial.begin(115200);
+  Serial.println("\n===== ESP32 Wroom MQTT 클라이언트 =====");
+  
+  // 핀 모드 설정
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(FAN_PIN, OUTPUT);
+  pinMode(PUMP_PIN, OUTPUT);
+  
+  // 초기 상태 - 모든 출력 끄기
+  digitalWrite(LED_PIN, LOW);
+  digitalWrite(FAN_PIN, LOW);
+  digitalWrite(PUMP_PIN, LOW);
+  
+  // 센서 초기화
+  dht.begin();
+  
+  // 서보 초기화
+  feederServo.attach(FEEDER_SERVO_PIN);
+  feederServo.write(0); // 초기 위치
+  
+  // WiFi 연결
+  setupWifi();
+  
+  // MQTT 설정
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+  
+  Serial.println("초기화 완료");
+}
+
+void loop() {
+  // MQTT 연결 확인
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+  
+  // 현재 시간
+  unsigned long currentMillis = millis();
+  
+  // 센서 데이터 주기적 발행
+  if (currentMillis - lastSensorPublish >= sensorInterval) {
+    lastSensorPublish = currentMillis;
+    publishSensorData();
+  }
+  
+  // 자동 모드 제어
+  if (autoMode) {
+    autoControl();
+  }
+}
+
+// WiFi 연결 함수
+void setupWifi() {
+  delay(10);
+  Serial.println();
+  Serial.print("WiFi 연결 중: ");
+  Serial.println(ssid);
+  
+  WiFi.begin(ssid, password);
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  Serial.println("");
+  Serial.println("WiFi 연결됨");
+  Serial.print("IP 주소: ");
+  Serial.println(WiFi.localIP());
+}
+
+// MQTT 재연결 함수
+void reconnect() {
+  // 연결될 때까지 시도
+  while (!client.connected()) {
+    Serial.print("MQTT 연결 시도 중...");
+    
+    // 연결 시도
+    if (client.connect(mqtt_client_id, mqtt_username, mqtt_password)) {
+      Serial.println("연결됨");
+      
+      // 토픽 구독
+      client.subscribe(topic_led);
+      client.subscribe(topic_fan);
+      client.subscribe(topic_pump);
+      client.subscribe(topic_feeder);
+      client.subscribe(topic_mode);
+      
+      // 연결 상태 알림 발행
+      client.publish(topic_status, "online");
+    } else {
+      Serial.print("실패, rc=");
+      Serial.print(client.state());
+      Serial.println(" 5초 후 재시도");
+      delay(5000);
+    }
+  }
+}
+
+// MQTT 메시지 수신 콜백
+void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("메시지 수신 [");
+  Serial.print(topic);
+  Serial.print("]: ");
+  
+  // 페이로드를 문자열로 변환
+  char message[length + 1];
+  for (int i = 0; i < length; i++) {
+    message[i] = (char)payload[i];
+  }
+  message[length] = '\0';
+  Serial.println(message);
+  
+  // JSON 파싱
+  StaticJsonDocument<200> doc;
+  DeserializationError error = deserializeJson(doc, message);
+  
+  if (error) {
+    Serial.print("JSON 파싱 실패: ");
+    Serial.println(error.c_str());
+    return;
+  }
+  
+  // LED 제어
+  if (strcmp(topic, topic_led) == 0) {
+    bool state = doc["state"];
+    setLED(state);
+  }
+  // 환기팬 제어
+  else if (strcmp(topic, topic_fan) == 0) {
+    bool state = doc["state"];
+    setFan(state);
+  }
+  // 워터펌프 제어
+  else if (strcmp(topic, topic_pump) == 0) {
+    bool state = doc["state"];
+    if (doc.containsKey("duration")) {
+      int duration = doc["duration"];
+      activatePump(duration);
+    } else {
+      setPump(state);
+    }
+  }
+  // 사료 급여기 제어
+  else if (strcmp(topic, topic_feeder) == 0) {
+    activateFeeder();
+  }
+  // 모드 설정 (자동/수동)
+  else if (strcmp(topic, topic_mode) == 0) {
+    autoMode = doc["auto"];
+    
+    if (doc.containsKey("targetTemp")) {
+      targetTemp = doc["targetTemp"];
+    }
+    
+    if (doc.containsKey("targetHumidity")) {
+      targetHumidity = doc["targetHumidity"];
+    }
+    
+    Serial.print("모드 변경: ");
+    Serial.println(autoMode ? "자동" : "수동");
+    Serial.print("목표 온도: ");
+    Serial.println(targetTemp);
+    Serial.print("목표 습도: ");
+    Serial.println(targetHumidity);
+  }
+}
+
+// 센서 데이터 발행 함수
+void publishSensorData() {
+  // DHT 센서 읽기
+  float newTemp = dht.readTemperature();
+  float newHumidity = dht.readHumidity();
+  
+  // 유효한 값인지 확인
+  if (isnan(newTemp) || isnan(newHumidity)) {
+    Serial.println("DHT 센서 읽기 실패!");
+    return;
+  }
+  
+  // 값 업데이트
+  temperature = newTemp;
+  humidity = newHumidity;
+  
+  // JSON 생성
+  StaticJsonDocument<200> doc;
+  doc["temperature"] = temperature;
+  doc["humidity"] = humidity;
+  doc["ledState"] = ledState;
+  doc["fanState"] = fanState;
+  doc["pumpState"] = pumpState;
+  doc["autoMode"] = autoMode;
+  
+  // JSON 직렬화
+  char buffer[256];
+  serializeJson(doc, buffer);
+  
+  // MQTT로 발행
+  client.publish(topic_sensor_data, buffer);
+  Serial.println("센서 데이터 발행 완료");
+}
+
+// 자동 제어 함수
+void autoControl() {
+  // 온도 기반 환기팬 제어
+  if (temperature > targetTemp + 1.0) {
+    if (!fanState) {
+      setFan(true);
+      Serial.println("자동 제어: 환기팬 켜짐 (온도 높음)");
+    }
+  } else if (temperature < targetTemp - 1.0) {
+    if (fanState) {
+      setFan(false);
+      Serial.println("자동 제어: 환기팬 꺼짐 (온도 낮음)");
+    }
+  }
+  
+  // 습도 기반 워터펌프 제어
+  if (humidity < targetHumidity - 5.0 && !pumpState) {
+    activatePump(3000); // 3초간 펌프 작동
+    Serial.println("자동 제어: 워터펌프 작동 (습도 낮음)");
+  }
+}
+
+// LED 제어 함수
+void setLED(bool state) {
+  ledState = state;
+  digitalWrite(LED_PIN, state);
+  Serial.print("LED: ");
+  Serial.println(state ? "켜짐" : "꺼짐");
+}
+
+// 환기팬 제어 함수
+void setFan(bool state) {
+  fanState = state;
+  digitalWrite(FAN_PIN, state);
+  Serial.print("환기팬: ");
+  Serial.println(state ? "켜짐" : "꺼짐");
+}
+
+// 워터펌프 제어 함수
+void setPump(bool state) {
+  pumpState = state;
+  digitalWrite(PUMP_PIN, state);
+  Serial.print("워터펌프: ");
+  Serial.println(state ? "켜짐" : "꺼짐");
+}
+
+// 워터펌프 일시적 작동 함수
+void activatePump(int duration) {
+  setPump(true);
+  delay(duration);
+  setPump(false);
+}
+
+// 사료 급여기 작동 함수
+void activateFeeder() {
+  Serial.println("사료 급여 시작");
+  feederServo.write(180); // 급여 위치로 회전
+  delay(1000);
+  feederServo.write(0);   // 초기 위치로 복귀
+  Serial.println("사료 급여 완료");
+}
